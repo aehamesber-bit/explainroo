@@ -1,0 +1,120 @@
+name: render
+
+# Render a video in the cloud and download the MP4 on your phone.
+#
+# The project must be committed to the repository. Keep it outside `videos/`,
+# because that folder is gitignored: use `examples/<name>/` or `projects/<name>/`.
+#
+# Run it from github.com on your phone: Actions -> render -> Run workflow,
+# then open the finished run and download the "video-<n>" artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: "Project folder in the repo, e.g. examples/how-dns-works"
+        required: true
+        default: "examples/how-dns-works"
+      size:
+        description: "youtube, tiktok, vertical, square, 1080x1920 … (empty = video.json)"
+        required: false
+        default: ""
+      draft:
+        description: "Half-size draft (faster, lower quality)"
+        type: boolean
+        default: true
+      format:
+        description: "Output format"
+        type: choice
+        options: [mp4, gif, webm, mov]
+        default: mp4
+      seconds:
+        description: "Render only the first N seconds (empty = the whole video)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: render-${{ github.ref }}-${{ inputs.project }}
+  cancel-in-progress: true
+
+jobs:
+  render:
+    name: Render ${{ inputs.project }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install ffmpeg
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+
+      # Kokoro and Whisper live in ~/.cache/explainroo (about 400 MB). Keeping
+      # them between runs saves the download; the key follows package-lock.json.
+      - name: Cache the speech models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/explainroo
+          key: explainroo-models-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            explainroo-models-${{ runner.os }}-
+
+      - run: npm ci
+
+      # GitHub's Ubuntu runners already have Google Chrome, so no Playwright
+      # browser download is needed.
+      - name: Check the setup
+        run: node bin/explainroo.js doctor --fetch
+
+      - name: Check the project
+        env:
+          PROJECT: ${{ inputs.project }}
+          SIZE: ${{ inputs.size }}
+        run: |
+          args=()
+          if [ -n "$SIZE" ]; then args+=(--size "$SIZE"); fi
+          node bin/explainroo.js check "$PROJECT" "${args[@]}"
+
+      - name: Render
+        env:
+          PROJECT: ${{ inputs.project }}
+          SIZE: ${{ inputs.size }}
+          FORMAT: ${{ inputs.format }}
+          DRAFT: ${{ inputs.draft }}
+          SECONDS_LIMIT: ${{ inputs.seconds }}
+        run: |
+          args=(--format "$FORMAT" --workers 2)
+          if [ "$DRAFT" = "true" ]; then args+=(--draft); fi
+          if [ -n "$SIZE" ]; then args+=(--size "$SIZE"); fi
+          if [ -n "$SECONDS_LIMIT" ]; then args+=(--from 0 --to "$SECONDS_LIMIT"); fi
+          node bin/explainroo.js render "$PROJECT" "${args[@]}"
+
+      - name: Verify the file
+        if: ${{ inputs.draft == false }}
+        continue-on-error: true
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: node bin/explainroo.js verify "$PROJECT"
+
+      - name: Upload the video
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ github.run_number }}
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ inputs.project }}/out/*.mp4
+            ${{ inputs.project }}/out/*.webm
+            ${{ inputs.project }}/out/*.mov
+            ${{ inputs.project }}/out/*.gif
+            ${{ inputs.project }}/out/*.srt
+            ${{ inputs.project }}/out/*.vtt
+            ${{ inputs.project }}/out/*.jpg
+            ${{ inputs.project }}/out/*.txt
